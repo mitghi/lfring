@@ -22,15 +22,20 @@
 * SOFTWARE.
  */
 
+// Package lfring provides Lock-Free Multi-Reader, Multi-Writer Ring Buffer implementation.
 package lfring
 
 import (
+	"errors"
 	"runtime"
 	"sync/atomic"
 	"unsafe"
-
-	"github.com/mitghi/x/pointers"
 )
+
+/*
+* implementation of Multi-Word Compare-and-Swap
+* atomic operation.
+ */
 
 /**
 * TODO:
@@ -41,6 +46,49 @@ import (
 * . refactor TryPop(....)
 * . bound checks for counter
 **/
+
+// Defaults
+const (
+	// ui64MASK is maximum int value
+	ui64NMASK = ^uint64(0)
+	// cRDSCHDTHRESHOLD is reader's spin threshold before
+	// yielding control with `runtime.Gosched()`.
+	cRDSCHDTHRESHOLD = 1000
+	// cWRSCHDTHRESHOLD is writer's spin threshold
+	// before yielding control with `runtime.Gosched()`.
+	cWRSCHDTHRESHOLD = 1000
+)
+
+const (
+	cArchADDRSIZE = 32 << uintptr(^uintptr(0)>>63)
+	cArchWORDSIZE = cArchADDRSIZE >> 3
+	cArchMAXTAG   = cArchWORDSIZE - 1
+	cArchPTRMASK  = ^uintptr((cArchADDRSIZE >> 5) + 1)
+)
+
+var (
+	EPTRINVAL  error = errors.New("pointer: invalid.")
+	EPTRINVALT error = errors.New("pointer: invalid tag.")
+)
+
+var (
+	_PTR_         unsafe.Pointer
+	_INTERFACE_   interface{}
+	ArchPTRSIZE   uintptr = unsafe.Sizeof(_PTR_)
+	sizeINTERFACE uintptr = unsafe.Sizeof(_INTERFACE_)
+)
+
+// - MARK: Struct section.
+
+// Ring is a aligned struct with size of 64 bytes
+// used to implement ring buffer. Note that ring
+// capacity is always rounded to next power of 2.
+type Ring struct {
+	// 64bit aligned
+	nodes                  []unsafe.Pointer // storage with capacity `size`, pow2
+	wri, rdi, maxrdi, size uint64           // write, read, max-read and size (mask) indexes
+	count                  uint64           // occupancy counter
+}
 
 // - MARK: Alloc/Init section.
 
@@ -97,7 +145,7 @@ func (r *Ring) Push(data interface{}) bool {
 		}
 	}
 	// put data pointer in the slot
-	if pointers.SetSliceSlot(unsafe.Pointer(&r.nodes), int(currwri%(mask-1)), pointers.ArchPTRSIZE, unsafe.Pointer(&data)) {
+	if SetSliceSlot(unsafe.Pointer(&r.nodes), int(currwri%(mask-1)), ArchPTRSIZE, unsafe.Pointer(&data)) {
 		// update readers boundary
 		for !atomic.CompareAndSwapUint64(&r.maxrdi, currwri, currwri+1) {
 			i++
@@ -144,7 +192,7 @@ func (r *Ring) Pop() (interface{}, bool) {
 		// load data pointer from slot address
 		// get and store data pointer from current slot
 		index = int(currdi % (mask - 1))
-		offset = pointers.OffsetSliceSlot(entry, index, pointers.ArchPTRSIZE)
+		offset = OffsetSliceSlot(entry, index, ArchPTRSIZE)
 		dataptr = atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(offset)))
 		if dptr := (*interface{})(dataptr); dptr != nil {
 			data = *dptr
@@ -152,7 +200,7 @@ func (r *Ring) Pop() (interface{}, bool) {
 			i++
 			continue
 		}
-		if pointers.HasTag(dataptr) {
+		if HasTag(dataptr) {
 			// dataptr is `rdcssDescriptor` which
 			// indicates ongoing RDCSS operation
 			// on current slot.
@@ -168,7 +216,7 @@ func (r *Ring) Pop() (interface{}, bool) {
 		// to current thread, because `rdcssDescriptor`
 		// acts as a barrier and prevents other threads
 		// from performing operations.
-		if pointers.RDCSS(
+		if RDCSS(
 			(*unsafe.Pointer)(rdiptr),
 			(unsafe.Pointer)(unsafe.Pointer(uintptr(currdi))),
 			(*unsafe.Pointer)(unsafe.Pointer(slotptr)),
@@ -220,7 +268,7 @@ func (r *Ring) TryPop(maxwait int) (interface{}, bool) {
 			return nil, false
 		}
 		index = int(currdi % (mask - 1))
-		offset = pointers.OffsetSliceSlot(entry, index, pointers.ArchPTRSIZE)
+		offset = OffsetSliceSlot(entry, index, ArchPTRSIZE)
 		dataptr = atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(offset)))
 		// NOTE
 		// . `interface{}` loses type information
@@ -232,13 +280,13 @@ func (r *Ring) TryPop(maxwait int) (interface{}, bool) {
 			waitcnt++
 			continue
 		}
-		if pointers.HasTag(dataptr) {
+		if HasTag(dataptr) {
 			i++
 			waitcnt++
 			continue
 		}
 		slotptr = unsafe.Pointer(offset)
-		if pointers.RDCSS(
+		if RDCSS(
 			(*unsafe.Pointer)(rdiptr),
 			(unsafe.Pointer)(unsafe.Pointer(uintptr(currdi))),
 			(*unsafe.Pointer)(unsafe.Pointer(slotptr)),
@@ -277,4 +325,317 @@ func roundP2(v uint64) uint64 {
 	v++
 
 	return v
+}
+
+// - MARK: Multi-Word Compare-and-Swap Operation section.
+
+// RDCSSDescriptor is descriptor for Multi-Word CAS. RDCSS
+// is defined as a restricted form of CAS2 operating atomi-
+// cally as follow:
+//
+// word_t RDCSS(word_t *a1,
+//              word_t o1,
+//              word_t *a2,
+//              word_t o2,
+//              word_t n) {
+//   r = *a2;
+//   if ((r  == o2) && (*a1 == o1)) *a2 = n;
+//   return r;
+// }
+type RDCSSDescriptor struct {
+	a1 *unsafe.Pointer // control address
+	o1 unsafe.Pointer  // expected value
+	a2 *unsafe.Pointer // data address
+	o2 unsafe.Pointer  // old value
+	n  unsafe.Pointer  // new value
+}
+
+// RDCSS performs a Double-Compare Single-Swap atomic
+// operation. It attempts to change data address pointer
+// `a2` to a `rdcssDescriptor` by comparing it against
+// old value `o2`. When successfull, the pointer is changed
+// to new value `n` or re-instiated to `o2` in case of
+// unsuccessfull operation; A descriptor is active when
+// referenced from `a2`. Pointer tagging is used to distinct
+// `rdcssDescriptor` pointers.
+func RDCSS(a1 *unsafe.Pointer, o1 unsafe.Pointer, a2 *unsafe.Pointer, o2 unsafe.Pointer, n unsafe.Pointer) bool {
+	// Paper: A Practical Multi-Word Compare-and-Swap Operation
+	//        by Timothy L. Harris, Keir Fraser and Ian A. Pratt;
+	//        University of Cambridge Computer Laboratory, Cambridge,
+	//        UK.
+	var (
+		desc *RDCSSDescriptor = &RDCSSDescriptor{a1, o1, a2, o2, n}
+		dptr unsafe.Pointer
+	)
+	// add `0x1` tag
+	dptr, _ = TaggedPointer(unsafe.Pointer(desc), 1)
+	if atomic.CompareAndSwapPointer(
+		(*unsafe.Pointer)(unsafe.Pointer(desc.a2)),
+		(unsafe.Pointer)(desc.o2),
+		(unsafe.Pointer)(dptr),
+	) {
+		return RDCSSComplete(dptr)
+	}
+	return false
+}
+
+// RDCSSComplete performs the second stage when descriptor
+// is succesfully stored in `a2`. It finishes the operation
+// by swapping `a2` with target pointer `n`. The operation
+// is successfull, when `a2` is not pointing to RDCSSDescriptor.
+// In case of unsucessfull operation, `a2` is swapped with `o2` and
+// returns false. Note, `RDCSSDescriptor` pointers have a 0x1
+// tag attached to low-order bits.
+func RDCSSComplete(d unsafe.Pointer) bool {
+	var (
+		desc   *RDCSSDescriptor
+		tgdptr unsafe.Pointer = d
+		dptr   unsafe.Pointer = Untag(d)
+	)
+	desc = (*RDCSSDescriptor)(dptr)
+	if (*desc.a1 == desc.o1) && atomic.CompareAndSwapPointer(
+		(*unsafe.Pointer)(unsafe.Pointer(desc.a2)),
+		(unsafe.Pointer)(unsafe.Pointer(tgdptr)),
+		(unsafe.Pointer)(desc.n),
+	) {
+		return true
+	}
+	if !atomic.CompareAndSwapPointer(
+		(*unsafe.Pointer)(unsafe.Pointer(desc.a2)),
+		(unsafe.Pointer)(tgdptr),
+		(unsafe.Pointer)(desc.o2),
+	) {
+		// TODO
+		// . restore ( unable to restore case )
+	}
+	return false
+}
+
+// IsRDCSSDescriptor checks whether the given pointer
+// `addr` is pointong to `RDCSSDescriptor`or not. According
+// to original paper ( Section 6.2 ), `RDCSSDescriptor`
+// pointers can be made distinct by non-zero low-order
+// bits. A pointer is pointing to `RDCSSDescriptor` iff
+// `0x1` is present.
+func IsRDCSSDescriptor(addr unsafe.Pointer) bool {
+	return HasTag(addr)
+}
+
+// - MARK: Atomics section.
+
+// CASSliceSlot is a function that performs a CAS operation
+// on a given slice slot by performing pointer arithmitic
+// to find slot address. `addr` is a pointer to slice,
+// `data` is a pointer to old value to be compared,
+// `target` is a pointer to the new value,  `index` is
+// the slot number and `ptrsize` is the slice value size.
+// It returns true when succesfull.
+func CASSliceSlot(addr unsafe.Pointer, data unsafe.Pointer, target unsafe.Pointer, index int, ptrsize uintptr) bool {
+	var (
+		tptr *unsafe.Pointer
+		cptr unsafe.Pointer
+	)
+	tptr = (*unsafe.Pointer)(unsafe.Pointer(*(*uintptr)(addr) + (ptrsize * uintptr(index))))
+	cptr = unsafe.Pointer(tptr)
+	return atomic.CompareAndSwapPointer(
+		(*unsafe.Pointer)(unsafe.Pointer(cptr)),
+		(unsafe.Pointer)(unsafe.Pointer(target)),
+		(unsafe.Pointer)(unsafe.Pointer(data)),
+	)
+}
+
+// CASSliceSlotPtr is a function that performs a CAS operation
+// on a given slice slot by performing pointer arithmitic
+// to find slot pointer address. `addr` is a pointer to slice,
+// `data` is a pointer to old value to be compared,
+// `target` is a pointer to the new value,  `index` is
+// the slot number and `ptrsize` is the slice value size.
+// It returns true when succesfull.
+func CASSliceSlotPtr(addr unsafe.Pointer, data unsafe.Pointer, target unsafe.Pointer, index int, ptrsize uintptr) bool {
+	var (
+		tptr *unsafe.Pointer
+		cptr unsafe.Pointer
+	)
+	tptr = (*unsafe.Pointer)(unsafe.Pointer((uintptr)(addr) + (ptrsize * uintptr(index))))
+	cptr = unsafe.Pointer(tptr)
+	return atomic.CompareAndSwapPointer(
+		(*unsafe.Pointer)(unsafe.Pointer(cptr)),
+		(unsafe.Pointer)(unsafe.Pointer(target)),
+		(unsafe.Pointer)(unsafe.Pointer(data)),
+	)
+}
+
+// CASArraySlot is a function that performs a CAS operation
+// on a given array slot by performing pointer arithmitic
+// to find slot address. `addr` is a pointer to array,
+// `data` is a pointer to old value to be compared,
+// `target` is a pointer to the new value,  `index` is
+// the slot number and `ptrsize` is the slice value size.
+// It returns true when succesfull.
+func CASArraySlot(addr unsafe.Pointer, data unsafe.Pointer, target unsafe.Pointer, index int, ptrsize uintptr) bool {
+	var (
+		tptr *unsafe.Pointer
+		cptr unsafe.Pointer
+	)
+	tptr = (*unsafe.Pointer)(unsafe.Pointer((uintptr)(addr) + (ptrsize * uintptr(index))))
+	cptr = unsafe.Pointer(tptr)
+	return atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(cptr)),
+		(unsafe.Pointer)(unsafe.Pointer(target)),
+		(unsafe.Pointer)(unsafe.Pointer(data)),
+	)
+}
+
+// OffsetArraySlot takes a array pointer and returns
+// slot address by adding `index` times `ptrsize` bytes
+// to slice data pointer.
+func OffsetArraySlot(addr unsafe.Pointer, index int, ptrsize uintptr) unsafe.Pointer {
+	return unsafe.Pointer((*unsafe.Pointer)(unsafe.Pointer((uintptr)(addr) + (ptrsize * uintptr(index)))))
+}
+
+// OffsetSliceSlot takes a slice pointer and returns
+// slot address by adding `index` times `ptrsize` bytes
+// to slice data pointer.
+func OffsetSliceSlot(addr unsafe.Pointer, index int, ptrsize uintptr) unsafe.Pointer {
+	return unsafe.Pointer(*(*uintptr)(addr) + (ptrsize * uintptr(index)))
+}
+
+// SetSliceSlot is a wrapper function that writes `d`
+// to the given slice slot iff its nil and returns
+// true when succesfull.
+func SetSliceSlot(addr unsafe.Pointer, index int, ptrsize uintptr, d unsafe.Pointer) bool {
+	return CASSliceSlot(addr, d, nil, index, ptrsize)
+}
+
+// SetSliceSlotPtr is a wrapper function that writes `d`
+// to the given slice slot opinter iff its nil and returns
+// true when succesfull.
+func SetSliceSlotPtr(addr unsafe.Pointer, index int, ptrsize uintptr, d unsafe.Pointer) bool {
+	return CASSliceSlotPtr(addr, d, nil, index, ptrsize)
+}
+
+// SetSliceSlotI is a wrapper function that writes `d`
+// to the given slice slot iff its nil and return
+// true when succesfull. Note, it differs from
+// `SetSliceSlot` because `d` is written as a pointer
+// to `interface{}`.
+func SetSliceSlotI(addr unsafe.Pointer, index int, ptrsize uintptr, d interface{}) bool {
+	return CASSliceSlot(addr, unsafe.Pointer(&d), nil, index, ptrsize)
+}
+
+// SetArraySlot is a wrapper function that writes `d`
+// to the given array slot iff its nil. It returns
+// true when succesfull.
+func SetArraySlot(addr unsafe.Pointer, index int, ptrsize uintptr, d unsafe.Pointer) bool {
+	return CASArraySlot(addr, d, nil, index, ptrsize)
+}
+
+// LoadArraySlot takes a array pointer and loads
+// slot address by adding `index` times `ptrsize` bytes
+// to slice data pointer.
+func LoadArraySlot(addr unsafe.Pointer, index int, ptrsize uintptr) unsafe.Pointer {
+	var (
+		tptr *unsafe.Pointer
+	)
+	tptr = (*unsafe.Pointer)(unsafe.Pointer((uintptr)(addr) + (ptrsize * uintptr(index))))
+	return atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(tptr)))
+}
+
+// LoadSliceSlot takes a slice pointer and loads
+// slot address by adding `index` times `ptrsize` bytes
+// to slice data pointer.
+func LoadSliceSlot(addr unsafe.Pointer, index int, ptrsize uintptr) unsafe.Pointer {
+	var (
+		bin *unsafe.Pointer
+	)
+	bin = (*unsafe.Pointer)(unsafe.Pointer(*(*uintptr)(addr) + (ptrsize * uintptr(index))))
+	return atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(bin)))
+}
+
+// PopArraySlot is a wrapper function that pops
+// `index` slot of array iff its nil. It returns
+// a pointer and true when succesfull.
+func PopArraySlot(addr unsafe.Pointer, index int, ptrsize uintptr) (unsafe.Pointer, bool) {
+	var (
+		slot unsafe.Pointer = LoadArraySlot(addr, index, ptrsize)
+	)
+	if !CASArraySlot(addr, nil, slot, index, ptrsize) {
+		return nil, false
+	}
+
+	return slot, true
+}
+
+// PopSliceSlot is a wrapper function that pops
+// `index` slot of slice iff its nil. It returns
+// a pointer and true when succesfull.
+func PopSliceSlot(addr unsafe.Pointer, index int, ptrsize uintptr) (unsafe.Pointer, bool) {
+	var (
+		slot unsafe.Pointer = LoadSliceSlot(addr, index, ptrsize)
+	)
+	if !CASSliceSlot(addr, nil, slot, index, ptrsize) {
+		return nil, false
+	}
+
+	return slot, true
+}
+
+// CompareAndSwapPointerTag performs CAS operation
+// and swaps `source` to `source` with new tag
+// when comparision is successfull. It reutrns a
+// pointer and boolean to to indicate its success.
+func CompareAndSwapPointerTag(source unsafe.Pointer, oldtag uint, newtag uint) (unsafe.Pointer, bool) {
+	if oldtag > cArchMAXTAG || newtag > cArchMAXTAG {
+		panic(EPTRINVALT)
+	}
+	var (
+		sraw   unsafe.Pointer = Untag(source)
+		sptr   unsafe.Pointer
+		target unsafe.Pointer
+	)
+	sptr, _ = TaggedPointer(sraw, oldtag)
+	target, _ = TaggedPointer(sraw, newtag)
+	if atomic.CompareAndSwapPointer(
+		(*unsafe.Pointer)(unsafe.Pointer(&sptr)),
+		(unsafe.Pointer)(source),
+		(unsafe.Pointer)(target),
+	) {
+		return target, true
+	}
+
+	return nil, false
+}
+
+// - MARK: Pointer-Tagging section.
+
+// GetTag returns the tag value from
+// low-order bits.
+func GetTag(ptr unsafe.Pointer) uint {
+	return uint(uintptr(ptr) & uintptr(cArchMAXTAG))
+}
+
+// TaggedPointer is a function for tagging pointers.
+// It attaches `tag` value to the pointer `ptr` iff
+// `tag` <= `ArchMAXTAG` and returns the tagged pointer
+// along with error set to `nil`. It panics when
+// `tag` > `ArchMAXTAG`, I do too! It's like getting
+// headshot by a champagne cork.
+func TaggedPointer(ptr unsafe.Pointer, tag uint) (unsafe.Pointer, error) {
+	if tag > cArchMAXTAG {
+		// flip the table, not this time!
+		panic(EPTRINVALT)
+	}
+	return unsafe.Pointer(uintptr(ptr) | uintptr(tag)), nil
+}
+
+// Untag is a function for untagging pointers. It
+// returns a `unsafe.Pointer` with low-order bits
+// set to 0.
+func Untag(ptr unsafe.Pointer) unsafe.Pointer {
+	return unsafe.Pointer(uintptr(ptr) & cArchPTRMASK)
+}
+
+// HasTag returns whether the given pointer `ptr`
+// is tagged.
+func HasTag(ptr unsafe.Pointer) bool {
+	return GetTag(ptr)&cArchMAXTAG > 0
 }
